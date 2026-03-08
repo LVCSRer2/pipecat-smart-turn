@@ -1,274 +1,248 @@
 """
-Smart Turn v3.2 실시간 마이크 데모
-=================================
-마이크로 음성을 입력받아 Silero VAD로 발화 구간을 감지하고,
-Smart Turn 모델로 발화 완료(EOT) 여부를 실시간으로 판별합니다.
-
-사용법:
-    pip install -r requirements.txt
-    python demo.py
-
-첫 실행 시 Silero VAD ONNX 모델과 Smart Turn v3.2 ONNX 모델을
-자동으로 다운로드합니다.
+Smart Turn v3.2 실시간 마이크 데모 (분석 모드 옵션 추가)
+======================================================
+--mode [single|retain] 옵션을 통해 분석 방식을 선택할 수 있습니다.
+- single: 각 발화 구간을 독립적으로 분석 (기존 방식)
+- retain: CONT 판정 시 오디오를 누적하여 다음 발화와 함께 분석 (링 버퍼 방식)
 """
 
 import os
 import sys
 import time
 import math
+import argparse
 import urllib.request
 from collections import deque
+import queue
 
 import numpy as np
 import sounddevice as sd
 from scipy.io import wavfile
 import onnxruntime as ort
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 # ── 설정 ──────────────────────────────────────────────────────────
 
-RATE = 16000            # 샘플링 레이트 (16kHz)
-CHUNK = 512             # VAD 청크 크기
+RATE = 16000
+CHUNK = 512
 CHANNELS = 1
 
-VAD_THRESHOLD = 0.5     # Silero VAD 임계값
-PRE_SPEECH_MS = 200     # 음성 시작 전 버퍼 (ms)
-STOP_MS = 1000          # 침묵 지속 시 발화 종료 판정 (ms)
-MAX_DURATION_SECONDS = 8  # 최대 발화 길이 (초)
+VAD_THRESHOLD = 0.5
+PRE_SPEECH_MS = 200
+STOP_MS = 1000
+MAX_DURATION_SECONDS = 8
+MAX_TOTAL_BUFFER_SECONDS = 15 # retain 모드에서 누적할 최대 시간
 
-DEBUG_SAVE_WAV = False  # True로 설정하면 각 발화를 WAV로 저장
-TEMP_OUTPUT_DIR = "debug_wavs"
-
-# 모델 경로
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SILERO_VAD_ONNX = os.path.join(SCRIPT_DIR, "silero_vad.onnx")
 SMART_TURN_ONNX = os.path.join(SCRIPT_DIR, "smart-turn-v3.2-cpu.onnx")
-
-SILERO_VAD_URL = (
-    "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
-)
-MODEL_RESET_STATES_TIME = 5.0
-
+SILERO_VAD_URL = "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
 
 # ── Silero VAD ────────────────────────────────────────────────────
 
 class SileroVAD:
-    """Silero VAD ONNX 래퍼 (16kHz mono, chunk=512)."""
-
     def __init__(self, model_path: str):
         opts = ort.SessionOptions()
         opts.inter_op_num_threads = 1
         opts.intra_op_num_threads = 1
-        self.session = ort.InferenceSession(
-            model_path, providers=["CPUExecutionProvider"], sess_options=opts
-        )
+        self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"], sess_options=opts)
         self.context_size = 64
-        self._state = None
-        self._context = None
-        self._last_reset_time = time.time()
-        self._init_states()
-
-    def _init_states(self):
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._context = np.zeros((1, self.context_size), dtype=np.float32)
 
-    def maybe_reset(self):
-        if (time.time() - self._last_reset_time) >= MODEL_RESET_STATES_TIME:
-            self._init_states()
-            self._last_reset_time = time.time()
-
     def prob(self, chunk_f32: np.ndarray) -> float:
         x = np.reshape(chunk_f32, (1, -1))
-        if x.shape[1] != CHUNK:
-            raise ValueError(f"Expected {CHUNK} samples, got {x.shape[1]}")
         x = np.concatenate((self._context, x), axis=1)
-
-        ort_inputs = {
-            "input": x.astype(np.float32),
-            "state": self._state,
-            "sr": np.array(16000, dtype=np.int64),
-        }
+        ort_inputs = {"input": x.astype(np.float32), "state": self._state, "sr": np.array(16000, dtype=np.int64)}
         out, self._state = self.session.run(None, ort_inputs)
-
         self._context = x[:, -self.context_size :]
-        self.maybe_reset()
         return float(out[0][0])
-
 
 # ── 모델 다운로드 ─────────────────────────────────────────────────
 
-def ensure_silero_vad():
-    """Silero VAD ONNX 모델이 없으면 다운로드."""
+def ensure_models():
     if not os.path.exists(SILERO_VAD_ONNX):
-        print("[다운로드] Silero VAD ONNX 모델...")
+        print("[다운로드] Silero VAD ONNX...")
         urllib.request.urlretrieve(SILERO_VAD_URL, SILERO_VAD_ONNX)
-        print("[완료] Silero VAD 다운로드 완료")
-    return SILERO_VAD_ONNX
-
-
-def ensure_smart_turn():
-    """Smart Turn v3.2 ONNX 모델이 없으면 HuggingFace에서 다운로드."""
     if not os.path.exists(SMART_TURN_ONNX):
-        print("[다운로드] Smart Turn v3.2 ONNX 모델 (HuggingFace)...")
-        try:
-            from huggingface_hub import hf_hub_download
+        print("[다운로드] Smart Turn v3.2 ONNX...")
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(repo_id="pipecat-ai/smart-turn-v3", filename="smart-turn-v3.2-cpu.onnx", local_dir=SCRIPT_DIR)
 
-            hf_hub_download(
-                repo_id="pipecat-ai/smart-turn-v3",
-                filename="smart-turn-v3.2-cpu.onnx",
-                local_dir=SCRIPT_DIR,
-            )
-            print("[완료] Smart Turn v3.2 다운로드 완료")
-        except Exception as e:
-            print(f"[오류] Smart Turn 모델 다운로드 실패: {e}")
-            print("수동으로 다운로드하세요:")
-            print("  https://huggingface.co/pipecat-ai/smart-turn-v3")
-            sys.exit(1)
-    return SMART_TURN_ONNX
+# ── 시각화 클래스 ──────────────────────────────────────────────────
 
+class PNGPlotter:
+    def __init__(self, mode_name, max_samples=200):
+        self.max_samples = max_samples
+        self.mode_name = mode_name
+        self.vad_probs = deque([0.0] * max_samples, maxlen=max_samples)
+        self.smart_turn_results = []
+        self.output_path = "realtime_monitor.png"
 
-# ── 발화 처리 ─────────────────────────────────────────────────────
+    def update_vad(self, prob):
+        self.vad_probs.append(prob)
+        new_results = []
+        for res in self.smart_turn_results:
+            res[0] -= 1
+            if res[0] >= 0: new_results.append(res)
+        self.smart_turn_results = new_results
 
-_segment_count = 0
+    def add_smart_turn(self, prob, is_eot):
+        self.smart_turn_results.append([self.max_samples - 1, prob, is_eot])
 
+    def clear_results(self):
+        self.smart_turn_results = []
 
-def process_segment(segment_audio_f32, predict_fn):
-    """발화 구간을 Smart Turn으로 분석."""
-    global _segment_count
+    def save(self, status_text="", info_text=""):
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.vad_probs, label="VAD Probability", color='blue', alpha=0.6, linewidth=2)
+        
+        eot_x, eot_y = [], []
+        cont_x, cont_y = [], []
+        for x, p, eot in self.smart_turn_results:
+            if eot: eot_x.append(x); eot_y.append(p)
+            else: cont_x.append(x); cont_y.append(p)
+        
+        if eot_x: plt.scatter(eot_x, eot_y, color='red', marker='x', s=150, linewidth=3, label="EOT (End)", zorder=5)
+        if cont_x: plt.scatter(cont_x, cont_y, color='green', marker='o', s=80, label="CONT (Continue)", zorder=5)
 
-    if segment_audio_f32.size == 0:
-        return
+        plt.ylim(-0.05, 1.05)
+        plt.xlim(0, self.max_samples)
+        plt.axhline(y=VAD_THRESHOLD, color='gray', linestyle='--', alpha=0.5)
+        
+        title_main = f"Smart Turn v3.2 Monitor [{self.mode_name.upper()}]"
+        title_sub = f" | {status_text}" if status_text else ""
+        plt.title(f"{title_main}{title_sub} ({time.strftime('%H:%M:%S')})")
+        
+        if info_text:
+            plt.text(self.max_samples - 5, 0.05, info_text, ha='right', fontsize=9, 
+                     bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
 
-    _segment_count += 1
-    dur_sec = segment_audio_f32.size / RATE
+        plt.legend(loc='upper left')
+        plt.grid(True, alpha=0.2)
+        plt.tight_layout()
+        plt.savefig(self.output_path)
+        plt.close()
 
-    # 디버그 WAV 저장
-    if DEBUG_SAVE_WAV:
-        os.makedirs(TEMP_OUTPUT_DIR, exist_ok=True)
-        wav_path = os.path.join(TEMP_OUTPUT_DIR, f"segment_{_segment_count:03d}.wav")
-        wavfile.write(wav_path, RATE, (segment_audio_f32 * 32767.0).astype(np.int16))
-
-    # Smart Turn 추론
-    t0 = time.perf_counter()
-    result = predict_fn(segment_audio_f32)
-    dt_ms = (time.perf_counter() - t0) * 1000.0
-
-    prediction = result["prediction"]
-    probability = result["probability"]
-
-    # 결과 출력
-    label = "EOT (발화 완료)" if prediction == 1 else "CONT (발화 중)"
-    bar = "█" * int(probability * 20) + "░" * (20 - int(probability * 20))
-
-    print()
-    print(f"  ┌─ 발화 #{_segment_count} ({dur_sec:.2f}초) ──────────────────")
-    print(f"  │ 판정: {label}")
-    print(f"  │ 확률: [{bar}] {probability:.4f}")
-    print(f"  │ 추론: {dt_ms:.1f}ms")
-    print(f"  └──────────────────────────────────────")
-    print()
-
-
-# ── 메인 루프 ─────────────────────────────────────────────────────
+# ── 메인 로직 ─────────────────────────────────────────────────────
 
 def main():
-    print()
-    print("=" * 50)
-    print("  Smart Turn v3.2 실시간 마이크 데모")
-    print("=" * 50)
-    print()
+    parser = argparse.ArgumentParser(description="Smart Turn v3.2 Demo with Retain Mode Option")
+    parser.add_argument("--mode", type=str, choices=["single", "retain"], default="retain",
+                        help="Analysis mode: 'single' (no history) or 'retain' (keep history if CONT)")
+    args = parser.parse_args()
 
-    # 모델 준비
-    print("[초기화] 모델 로딩 중...")
-    ensure_silero_vad()
-    ensure_smart_turn()
-
+    ensure_models()
     from inference import predict_endpoint
-
-    # VAD 초기화
     vad = SileroVAD(SILERO_VAD_ONNX)
+    
+    audio_queue = queue.Queue()
+    plotter = PNGPlotter(mode_name=args.mode)
 
-    # 오디오 스트림 파라미터
+    def audio_callback(indata, frames, time, status):
+        if status: print(status, file=sys.stderr)
+        audio_queue.put(indata.copy())
+
     chunk_ms = (CHUNK / RATE) * 1000.0
     pre_chunks = math.ceil(PRE_SPEECH_MS / chunk_ms)
     stop_chunks = math.ceil(STOP_MS / chunk_ms)
     max_chunks = math.ceil(MAX_DURATION_SECONDS / (CHUNK / RATE))
 
-    # 상태 변수
     pre_buffer = deque(maxlen=pre_chunks)
-    segment = []
+    current_segment = []
     speech_active = False
     trailing_silence = 0
     since_trigger_chunks = 0
+    
+    continued_audio_accum = np.array([], dtype=np.float32)
+    
+    frame_count = 0
+    status_msg = "Ready"
+    info_msg = ""
 
-    # 마이크 열기 (sounddevice blocking stream)
-    stream = sd.InputStream(
-        samplerate=RATE,
-        channels=CHANNELS,
-        dtype="int16",
-        blocksize=CHUNK,
-    )
-    stream.start()
+    print(f"\n[설정] 분석 모드: {args.mode.upper()}")
+    print("마이크 입력을 시작합니다... (Ctrl+C로 종료)")
 
-    print("[준비 완료] 마이크 입력 대기 중... (Ctrl+C로 종료)")
-    print()
-    print("  파이프라인: 마이크 → Silero VAD → Smart Turn v3.2 → EOT/CONT")
-    print("  - 말을 하면 VAD가 음성을 감지합니다")
-    print("  - 침묵이 1초 지속되면 Smart Turn이 발화 완료 여부를 판별합니다")
-    print("  - EOT: 발화 완료 (AI가 응답할 타이밍)")
-    print("  - CONT: 발화 중 (사용자가 아직 말하는 중)")
-    print()
+    stream = sd.InputStream(samplerate=RATE, channels=CHANNELS, dtype='int16', blocksize=CHUNK, callback=audio_callback)
+    
+    with stream:
+        try:
+            while True:
+                while not audio_queue.empty():
+                    data = audio_queue.get()
+                    int16 = data[:, 0]
+                    f32 = int16.astype(np.float32) / 32768.0
+                    
+                    v_prob = vad.prob(f32)
+                    plotter.update_vad(v_prob)
+                    is_speech = v_prob > VAD_THRESHOLD
 
-    try:
-        while True:
-            data, overflowed = stream.read(CHUNK)
-            int16 = data[:, 0]  # mono
-            f32 = int16.astype(np.float32) / 32768.0
+                    if not speech_active:
+                        pre_buffer.append(f32)
+                        if is_speech:
+                            plotter.clear_results()
+                            current_segment = list(pre_buffer)
+                            current_segment.append(f32)
+                            speech_active = True
+                            trailing_silence = 0
+                            since_trigger_chunks = 1
+                            status_msg = "Speech Detected"
+                            print(f"\n[{status_msg}]", end="", flush=True)
+                    else:
+                        current_segment.append(f32)
+                        since_trigger_chunks += 1
+                        if is_speech: trailing_silence = 0
+                        else: trailing_silence += 1
 
-            is_speech = vad.prob(f32) > VAD_THRESHOLD
+                        if trailing_silence >= stop_chunks or since_trigger_chunks >= max_chunks:
+                            print(" Analyzing...", end="")
+                            this_audio = np.concatenate(current_segment)
+                            
+                            # 오디오 병합 로직 (retain 모드일 때만 적용)
+                            if args.mode == "retain" and continued_audio_accum.size > 0:
+                                input_audio = np.concatenate([continued_audio_accum, this_audio])
+                            else:
+                                input_audio = this_audio
+                            
+                            info_msg = f"Audio: {input_audio.size/RATE:.1f}s"
+                            
+                            result = predict_endpoint(input_audio)
+                            prob = result["probability"]
+                            is_eot = result["prediction"] == 1
+                            
+                            plotter.add_smart_turn(prob, is_eot)
+                            
+                            if is_eot:
+                                label = "EOT (End)"
+                                continued_audio_accum = np.array([], dtype=np.float32)
+                                status_msg = "Finished"
+                            else:
+                                label = "CONT (Continued)"
+                                if args.mode == "retain":
+                                    continued_audio_accum = input_audio
+                                    max_samples = MAX_TOTAL_BUFFER_SECONDS * RATE
+                                    if continued_audio_accum.size > max_samples:
+                                        continued_audio_accum = continued_audio_accum[-max_samples:]
+                                status_msg = "Continuing..."
 
-            if not speech_active:
-                pre_buffer.append(f32)
-                if is_speech:
-                    # 음성 시작 감지
-                    segment = list(pre_buffer)
-                    segment.append(f32)
-                    speech_active = True
-                    trailing_silence = 0
-                    since_trigger_chunks = 1
-                    print("  음성 감지...", end="", flush=True)
-            else:
-                segment.append(f32)
-                since_trigger_chunks += 1
-
-                if is_speech:
-                    trailing_silence = 0
-                else:
-                    trailing_silence += 1
-
-                # 침묵 지속 또는 최대 길이 도달 → 발화 종료 처리
-                if trailing_silence >= stop_chunks or since_trigger_chunks >= max_chunks:
-                    print(" 분석 중...")
-                    stream.stop()
-
-                    audio = np.concatenate(segment, dtype=np.float32)
-                    process_segment(audio, predict_endpoint)
-
-                    # 상태 초기화
-                    segment.clear()
-                    speech_active = False
-                    trailing_silence = 0
-                    since_trigger_chunks = 0
-                    pre_buffer.clear()
-
-                    stream.start()
-                    print("  마이크 입력 대기 중...")
-
-    except KeyboardInterrupt:
-        print("\n\n[종료] 데모를 종료합니다.")
-    finally:
-        stream.stop()
-        stream.close()
-
+                            print(f" Result: {label} ({prob:.2f}) | {info_msg}")
+                            plotter.save(status_msg, info_msg)
+                            
+                            current_segment = []
+                            speech_active = False
+                            trailing_silence = 0
+                            since_trigger_chunks = 0
+                            pre_buffer.clear()
+                    
+                    frame_count += 1
+                    if frame_count % 30 == 0:
+                        plotter.save(status_msg, info_msg)
+                
+                time.sleep(0.01)
+        except KeyboardInterrupt:
+            print("\n데모를 종료합니다.")
 
 if __name__ == "__main__":
     main()

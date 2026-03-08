@@ -1,6 +1,7 @@
 numpy
 onnxruntime
 transformers
-pyaudio
 scipy
 huggingface_hub
+matplotlib
+sounddevice
