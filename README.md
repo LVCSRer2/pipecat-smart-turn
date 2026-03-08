@@ -1,13 +1,13 @@
-# Smart Turn v3.1 실시간 마이크 데모
+# Smart Turn v3.2 실시간 마이크 데모
 
-Pipecat(Daily.co)의 [Smart Turn v3.1](https://github.com/pipecat-ai/smart-turn) 모델을 활용한 실시간 발화 완료(End-of-Turn) 감지 데모입니다.
+Pipecat(Daily.co)의 [Smart Turn v3.2](https://github.com/pipecat-ai/smart-turn) 모델을 활용한 실시간 발화 완료(End-of-Turn) 감지 데모입니다.
 
 ## 개요
 
 마이크 음성 입력을 실시간으로 처리하여 사용자의 발화가 완료되었는지(EOT) 아직 말하는 중인지(CONT) 판별합니다.
 
 ```
-마이크 (16kHz mono) → Silero VAD (음성 구간 감지) → Smart Turn v3.1 (EOT/CONT 판별)
+마이크 (16kHz mono) → Silero VAD (음성 구간 감지) → Smart Turn v3.2 (EOT/CONT 판별)
 ```
 
 | 항목 | 값 |
@@ -39,12 +39,12 @@ python demo.py
 
 첫 실행 시 아래 모델을 자동 다운로드합니다:
 - **Silero VAD** ONNX (~2.3MB) - 음성 구간 감지용
-- **Smart Turn v3.1** ONNX (~8.7MB) - 발화 완료 판별용 ([HuggingFace](https://huggingface.co/pipecat-ai/smart-turn-v3))
+- **Smart Turn v3.2** ONNX (~8.7MB) - 발화 완료 판별용 ([HuggingFace](https://huggingface.co/pipecat-ai/smart-turn-v3))
 
 ## 동작 방식
 
 1. **Silero VAD**가 마이크 입력에서 음성 시작/종료를 실시간 감지
-2. 침묵이 1초 지속되면 해당 발화 구간을 **Smart Turn v3.1**에 전달
+2. 침묵이 1초 지속되면 해당 발화 구간을 **Smart Turn v3.2**에 전달
 3. 확률 ≥ 0.5 → **EOT** (발화 완료, AI 응답 타이밍) / < 0.5 → **CONT** (아직 말하는 중)
 
 ### 출력 예시
